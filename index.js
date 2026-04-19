@@ -83,7 +83,7 @@ async function startBot() {
             // Match the exact format of your RKK Admin Panel
             const RKKOrder = {
                 userId: "whatsapp_" + customerWaNumber,
-                userEmail: "whatsapp@RKK.com",
+                userEmail: "whatsapp@rkk.com",
                 phone: customerWaNumber, // Keeps their WA number registered
                 address: customerDetails, // Saves Name, Phone, and Address typed by them
                 location: { lat: 0, lng: 0 },
