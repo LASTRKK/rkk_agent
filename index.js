@@ -2,34 +2,44 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLat
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 
-// 🌟 SECURE FIREBASE URL FROM GITHUB SECRETS 🌟
+// 🔐 Firebase URL from GitHub Secrets
 const FIREBASE_URL = process.env.FIREBASE_URL;
 
-const orderStates = {}; 
+const orderStates = {};
 
-// Function to fetch the dynamic menu from your App's Firebase
+// ✅ SAFE FETCH FUNCTION (FIXES YOUR ERROR)
 async function getMenuFromApp() {
     try {
         const response = await fetch(`${FIREBASE_URL}/dishes.json`);
-        const data = await response.json();
-        if (!data) return[];
-        
-        // Convert Firebase object into an array (now includes imageUrl)
-        return Object.keys(data).map(key => ({
-            id: key,
-            name: data[key].name,
-            price: data[key].price,
-            imageUrl: data[key].imageUrl
-        }));
+
+        const text = await response.text(); // 👈 IMPORTANT
+
+        try {
+            const data = JSON.parse(text);
+
+            if (!data) return [];
+
+            return Object.keys(data).map(key => ({
+                id: key,
+                name: data[key].name,
+                price: data[key].price,
+                imageUrl: data[key].imageUrl
+            }));
+        } catch (err) {
+            console.error("❌ Firebase returned HTML instead of JSON:");
+            console.error(text.substring(0, 200));
+            return [];
+        }
+
     } catch (error) {
-        console.error("Failed to fetch menu:", error);
-        return[];
+        console.error("❌ Fetch Error:", error);
+        return [];
     }
 }
 
 async function startBot() {
     if (!FIREBASE_URL) {
-        console.log("❌ ERROR: FIREBASE_URL is missing in GitHub Secrets!");
+        console.log("❌ ERROR: FIREBASE_URL missing!");
         process.exit(1);
     }
 
@@ -41,23 +51,23 @@ async function startBot() {
         auth: state,
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser:["S", "K", "1"] 
+        browser: ["RKK", "Bot", "1.0"]
     });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
+
         if (qr) {
-            console.clear(); 
-            console.log('\n==================================================');
-            console.log('⚠️ QR CODE TOO BIG? CLICK "View raw logs" in top right!');
-            console.log('==================================================\n');
-            qrcode.generate(qr, { small: true }); 
+            console.clear();
+            console.log("📱 Scan QR:");
+            qrcode.generate(qr, { small: true });
         }
 
         if (connection === 'open') console.log('✅ RKK AI IS ONLINE!');
+
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
+            console.log("❌ Connection closed. Reconnecting...");
             if (reason !== DisconnectReason.loggedOut) startBot();
         }
     });
@@ -65,119 +75,168 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
-        if (msg.key.fromMe) return; // Loop Protection
+        try {
+            const msg = m.messages[0];
+            if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
+            if (msg.key.fromMe) return;
 
-        const sender = msg.key.remoteJid;
-        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").toLowerCase();
+            const sender = msg.key.remoteJid;
+            const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim().toLowerCase();
 
-        console.log(`📩 Query: ${text}`);
+            console.log(`📩 ${sender}: ${text}`);
 
-        // --- 🛒 STEP 2: FINISH ORDER & SEND TO ADMIN PANEL ---
-        if (orderStates[sender]?.step === 'WAITING_FOR_ADDRESS') {
-            const customerDetails = text; // This now contains Name, Phone, and Address
-            const item = orderStates[sender].item;
-            const customerWaNumber = sender.split('@')[0];
+            // ============================
+            // ✅ STEP 2: ADDRESS + ORDER
+            // ============================
+            if (orderStates[sender]?.step === 'WAITING_FOR_ADDRESS') {
 
-            // Match the exact format of your RKK Admin Panel
-            const RKKOrder = {
-                userId: "whatsapp_" + customerWaNumber,
-                userEmail: "whatsapp@rkk.com",
-                phone: customerWaNumber, // Keeps their WA number registered
-                address: customerDetails, // Saves Name, Phone, and Address typed by them
-                location: { lat: 0, lng: 0 },
-                items:[{
-                    id: item.id,
-                    name: item.name,
-                    price: parseFloat(item.price),
-                    img: item.imageUrl || "",
-                    quantity: 1
-                }],
-                total: (parseFloat(item.price) + 50).toFixed(2), // Price + 50 Delivery Fee
-                status: "Placed",
-                method: "Cash on Delivery (WhatsApp)",
-                timestamp: new Date().toISOString()
-            };
+                const details = text.split(",");
 
-            // Save order securely via REST API
-            try {
-                await fetch(`${FIREBASE_URL}/orders.json`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(RKKOrder)
-                });
-            } catch (error) {
-                console.log("Firebase Error: ", error);
-            }
+                if (details.length < 3) {
+                    await sock.sendMessage(sender, {
+                        text: "❌ Please send correctly:\n\nName, Phone, Address"
+                    });
+                    return;
+                }
 
-            await sock.sendMessage(sender, { text: `✅ *Order Placed Successfully!* \n\nThank you! Your order for *${item.name}* is being prepared. \n\n*Total:* ₹${RKKOrder.total} (Inc. Delivery)\n*Status:* Preparing\n\nWe will deliver it to your address soon.` });
-            delete orderStates[sender]; 
-            return;
-        }
+                const [name, phone, address] = details.map(d => d.trim());
 
-        // --- 🌟 STEP 1: START ORDER FLOW (WITH IMAGE & PHONE REQUEST) ---
-        if (text.startsWith("order ")) {
-            const productRequested = text.replace("order ", "").trim().toLowerCase();
-            const currentMenu = await getMenuFromApp();
-            
-            // Search the live database for the requested item
-            const matchedItem = currentMenu.find(item => item.name.toLowerCase().includes(productRequested));
+                // ✅ Phone validation
+                const phoneRegex = /^[6-9]\d{9}$/;
 
-            if (!matchedItem) {
-                await sock.sendMessage(sender, { text: `❌ Sorry, we couldn't find *${productRequested}* in our menu today.\n\nType *menu* to see all available items.` });
+                if (!phoneRegex.test(phone)) {
+                    await sock.sendMessage(sender, {
+                        text: "❌ Invalid phone number\nExample: 9876543210"
+                    });
+                    return;
+                }
+
+                const item = orderStates[sender].item;
+                const waNumber = sender.split('@')[0];
+
+                const orderData = {
+                    userId: "whatsapp_" + waNumber,
+                    phone,
+                    name,
+                    address,
+                    items: [{
+                        id: item.id,
+                        name: item.name,
+                        price: parseFloat(item.price),
+                        img: item.imageUrl || "",
+                        quantity: 1
+                    }],
+                    total: (parseFloat(item.price) + 50).toFixed(2),
+                    status: "Placed",
+                    method: "COD",
+                    timestamp: new Date().toISOString()
+                };
+
+                try {
+                    await fetch(`${FIREBASE_URL}/orders.json`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(orderData)
+                    });
+
+                    await sock.sendMessage(sender, {
+                        text: `✅ *Order Confirmed!*\n\n🍽 ${item.name}\n💰 ₹${orderData.total}\n📍 ${address}\n\n🚚 Status: Preparing`
+                    });
+
+                } catch (err) {
+                    console.log("❌ Order Save Error:", err);
+                    await sock.sendMessage(sender, {
+                        text: "❌ Failed to place order. Try again."
+                    });
+                }
+
+                delete orderStates[sender];
                 return;
             }
 
-            orderStates[sender] = { step: 'WAITING_FOR_ADDRESS', item: matchedItem };
-            
-            // 🌟 NEW: SEND PRODUCT IMAGE + ASK FOR PHONE NUMBER 🌟
-            const captionText = `🛒 *Order Started!* \n\nYou selected: *${matchedItem.name}* (₹${matchedItem.price})\n\nPlease reply with your *Full Name, Phone Number, and Delivery Address*.`;
-            
-            // If the product has an image URL in Firebase, send it as a WhatsApp Photo
-            if (matchedItem.imageUrl) {
-                await sock.sendMessage(sender, { 
-                    image: { url: matchedItem.imageUrl }, 
-                    caption: captionText 
+            // ============================
+            // 🛒 STEP 1: ORDER START
+            // ============================
+            if (text.startsWith("order ")) {
+
+                const productRequested = text.replace("order ", "").trim();
+                const menu = await getMenuFromApp();
+
+                const item = menu.find(i =>
+                    i.name.toLowerCase().includes(productRequested)
+                );
+
+                if (!item) {
+                    await sock.sendMessage(sender, {
+                        text: `❌ Item not found: ${productRequested}\nType *menu*`
+                    });
+                    return;
+                }
+
+                orderStates[sender] = {
+                    step: "WAITING_FOR_ADDRESS",
+                    item
+                };
+
+                const msgText = `🛒 *${item.name}* (₹${item.price})\n\nSend:\nName, Phone, Address`;
+
+                if (item.imageUrl) {
+                    await sock.sendMessage(sender, {
+                        image: { url: item.imageUrl },
+                        caption: msgText
+                    });
+                } else {
+                    await sock.sendMessage(sender, { text: msgText });
+                }
+            }
+
+            // ============================
+            // 📋 MENU
+            // ============================
+            else if (text.includes("menu")) {
+
+                const menu = await getMenuFromApp();
+
+                if (menu.length === 0) {
+                    await sock.sendMessage(sender, {
+                        text: "⚠️ Menu not available"
+                    });
+                    return;
+                }
+
+                let msgText = "🍔 *RKK MENU*\n\n";
+
+                menu.forEach(i => {
+                    msgText += `🔸 ${i.name} - ₹${i.price}\n`;
                 });
-            } else {
-                // Fallback if no image is found
-                await sock.sendMessage(sender, { text: captionText });
-            }
-        }
-        else if (text === "order") { 
-            await sock.sendMessage(sender, { text: "🛒 *How to order:* \nPlease type 'order' followed by the dish name. \nExample: *order pizza*" });
-        }
-        
-        // --- DYNAMIC MENU FEATURE ---
-        else if (text.includes("menu") || text.includes("price") || text.includes("list") || text.includes("food")) {
-            const currentMenu = await getMenuFromApp();
-            
-            if (currentMenu.length === 0) {
-                await sock.sendMessage(sender, { text: "Our menu is currently empty or updating. Please check back soon!" });
-                return;
+
+                msgText += "\n👉 order pizza";
+
+                await sock.sendMessage(sender, { text: msgText });
             }
 
-            let menuMessage = "🍔 *RKK LIVE MENU* 🍕\n\n";
-            currentMenu.forEach(item => {
-                menuMessage += `🔸 *${item.name}* - ₹${item.price}\n`;
-            });
-            menuMessage += "\n_To order, reply with 'order [dish name]'_";
-            
-            await sock.sendMessage(sender, { text: menuMessage });
-        }
+            // ============================
+            // 👋 GREETING
+            // ============================
+            else if (text.match(/hi|hello|hey/)) {
+                await sock.sendMessage(sender, {
+                    text: "👋 Welcome to RKK!\nType *menu*"
+                });
+            }
 
-        // --- GREETINGS ---
-        else if (text.includes("hi") || text.includes("hello") || text.includes("hey")) {
-            await sock.sendMessage(sender, { text: "👋 *Welcome to RKK!* \n\nI am your AI Assistant. Type *menu* to see our delicious food, or type *order [dish]* to buy instantly!" });
-        }
-        else if (text.includes("contact") || text.includes("call")) {
-            await sock.sendMessage(sender, { text: "📞 *Contact RKK:* \n\n- *Email:* support@RKK.com" });
-        }
-        else {
-            await sock.sendMessage(sender, { text: "🤔 I didn't quite catch that.\n\nType *menu* to see our food list, or *order [food]* to place an order!" });
+            // ============================
+            // ❓ DEFAULT
+            // ============================
+            else {
+                await sock.sendMessage(sender, {
+                    text: "❓ Type *menu* to start"
+                });
+            }
+
+        } catch (err) {
+            console.log("❌ Message Error:", err);
         }
     });
 }
 
-startBot().catch(err => console.log("Error: " + err));
+startBot();
